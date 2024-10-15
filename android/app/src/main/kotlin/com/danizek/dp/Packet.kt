@@ -1,5 +1,10 @@
 package com.danizek.dp
 
+import org.pcap4j.packet.IpV4Packet
+import org.pcap4j.packet.TcpPacket
+import org.pcap4j.packet.UdpPacket
+import org.pcap4j.packet.namednumber.IpNumber
+import org.pcap4j.packet.namednumber.UdpPort
 import java.nio.ByteBuffer
 import java.net.InetAddress
 
@@ -14,7 +19,10 @@ class Packet(
     val sourceIp: InetAddress,
     val destinationIp: InetAddress,
     val data: ByteArray,
-    val isIPv6: Boolean
+    val ipVersion: Int,
+    val headerSize: Int,
+    val payloadSize: Int,
+    val totalLength: Int
 ) {
 
     companion object {
@@ -23,17 +31,26 @@ class Packet(
             val buffer = ByteBuffer.wrap(bytes)
 
             // Identify IP version
-            val version = (buffer.get(0).toInt() shr 4) and 0x0F
-            val isIPv6 = false
+            val ipVersion = (buffer.get(0).toInt() shr 4) and 0x0F
 
             val sourceIp: InetAddress
             val destinationIp: InetAddress
             val sourcePort: Int
             val destinationPort: Int
             val protocol: Protocol
+            var headerSize: Int = 0
+            var payloadSize: Int = 0
+            var totalLength: Int = 0
 
-            if (!isIPv6) {
+            if (ipVersion == 4) {
                 // Parse IPv4 Header (20 bytes)
+                val ihl = buffer.get(0).toInt() and 0xF // Get header length
+                headerSize = ihl * 4
+
+                buffer.position(2)
+                totalLength = buffer.getShort().toInt() and 0xFFFF
+                payloadSize = totalLength - headerSize
+
                 buffer.position(9) // Move to protocol field
                 val protocolByte = buffer.get().toUInt()
                 protocol = if (protocolByte == 6u) Protocol.TCP else Protocol.UDP
@@ -80,54 +97,40 @@ class Packet(
             val data = ByteArray(buffer.remaining())
             buffer.get(data)
 
-            return Packet(sourcePort, destinationPort, protocol, sourceIp, destinationIp, data, isIPv6)
-        }
-    }
-
-    // Serialize Packet into a byte array
-    fun serialize(): ByteArray {
-        val ipHeaderSize = if (isIPv6) 40 else 20
-        val buffer = ByteBuffer.allocate(ipHeaderSize + 20 + data.size) // 20 for TCP/UDP header
-
-        // Write IP header
-        if (isIPv6) {
-            buffer.put(0x60.toByte()) // IPv6 version field
-            buffer.position(8) // Skip to source IP address
-            buffer.put(sourceIp.address) // Write source IP
-            buffer.put(destinationIp.address) // Write destination IP
-            buffer.position(40) // Skip rest of IPv6 header
-        } else {
-            buffer.put(0x45.toByte()) // IPv4 version and header length
-            buffer.position(9) // Skip to protocol field
-            buffer.put(if (protocol == Protocol.TCP) 6.toByte() else 17.toByte()) // Protocol
-            buffer.position(12) // Skip to source IP address
-            buffer.put(sourceIp.address) // Write source IP
-            buffer.put(destinationIp.address) // Write destination IP
-            buffer.position(20) // Skip rest of IPv4 header
+            return Packet(sourcePort, destinationPort, protocol, sourceIp, destinationIp, data, ipVersion, headerSize, payloadSize, totalLength)
         }
 
-        // Write transport layer headers (TCP/UDP)
-        buffer.putShort(sourcePort.toShort())
-        buffer.putShort(destinationPort.toShort())
-
-        if (protocol == Protocol.TCP) {
-            // Simplified TCP header
-            buffer.putInt(0) // Sequence number (placeholder)
-            buffer.putInt(0) // Acknowledgment number (placeholder)
-            buffer.putShort(0x5010.toShort()) // Data offset and flags
-        } else {
-            // Simplified UDP header
-            buffer.putShort((8 + data.size).toShort()) // Length
-            buffer.putShort(0) // Checksum placeholder
+        fun toString(packet: IpV4Packet): String {
+            if (packet.header.protocol == IpNumber.TCP) {
+                val tcpPacket = packet.payload as TcpPacket
+                var flags = ""
+                if (tcpPacket.header.syn) {
+                    flags += "SYN "
+                }
+                if (tcpPacket.header.ack) {
+                    flags += "ACK "
+                }
+                if (tcpPacket.header.fin) {
+                    flags += "FIN "
+                }
+                if (tcpPacket.header.rst) {
+                    flags += "RST "
+                }
+                if (tcpPacket.header.psh) {
+                    flags += "PSH "
+                }
+                if (tcpPacket.header.urg) {
+                    flags += "URG "
+                }
+                return "Packet(protocol=TCP, srcIP=${packet.header.srcAddr}, srcPort=${tcpPacket.header.srcPort}, destIP=${packet.header.dstAddr}, destPort=${tcpPacket.header.dstPort}, flags=${flags}, payloadLen=${if (tcpPacket.payload == null) 0 else tcpPacket.payload.rawData.size}), seq=${tcpPacket.header.sequenceNumber.toUInt()}, ack=${tcpPacket.header.acknowledgmentNumber.toUInt()}, options=${tcpPacket.header.options}, content=${tcpPacket.payload?.rawData?.toString(Charsets.UTF_8)}"
+            } else {
+                val udpPacket = packet.payload as UdpPacket
+                return "Packet(protocol=UDP, srcIP=${packet.header.srcAddr}, srcPort=${udpPacket.header.srcPort}, destIP=${packet.header.dstAddr}, destPort=${udpPacket.header.dstPort}, payloadLen=${if (udpPacket.payload == null) 0 else udpPacket.payload.rawData.size})"
+            }
         }
-
-        // Write data payload
-        buffer.put(data)
-
-        return buffer.array()
     }
 
     override fun toString(): String {
-        return "Packet(protocol=$protocol, srcPort=$sourcePort, destPort=$destinationPort, srcIP=$sourceIp, destIP=$destinationIp, isIPv6=$isIPv6, data=${data.decodeToString()})"
+        return "Packet(protocol=$protocol, srcPort=$sourcePort, destPort=$destinationPort, srcIP=$sourceIp, destIP=$destinationIp, ipVersion=${ipVersion}, len=${data.size})"
     }
 }
