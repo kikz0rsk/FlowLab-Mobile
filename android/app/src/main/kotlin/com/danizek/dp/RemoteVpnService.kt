@@ -16,282 +16,110 @@ import org.bouncycastle.openssl.PEMKeyPair
 import org.bouncycastle.openssl.PEMParser
 import org.bouncycastle.openssl.jcajce.JcaPEMKeyConverter
 import org.bouncycastle.openssl.jcajce.JcePEMDecryptorProviderBuilder
+import java.io.Closeable
 import java.io.EOFException
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.FileReader
+import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
 import java.net.InetSocketAddress
 import java.net.Socket
-import java.security.KeyPair
 import java.security.KeyStore
 import java.security.PrivateKey
 import java.security.Security
 import java.security.cert.Certificate
 import java.security.cert.X509Certificate
-import java.util.LinkedList
-import java.util.Queue
 import java.util.concurrent.atomic.AtomicBoolean
+import javax.net.ssl.KeyManager
 import javax.net.ssl.KeyManagerFactory
 import javax.net.ssl.SSLContext
 import javax.net.ssl.SSLSocket
+import javax.net.ssl.TrustManager
 import javax.net.ssl.TrustManagerFactory
 
-
+/**
+ * A [VpnService] that tunnels the device's IP traffic to a remote endpoint over a
+ * mutually-authenticated TLS connection.
+ *
+ * Two threads move packets in opposite directions:
+ *  - the relay thread reads from the TUN interface and writes to the remote socket;
+ *  - the remote reader thread reads from the remote socket and writes back to the TUN interface.
+ */
 class RemoteVpnService : VpnService(), IVpn {
+
     inner class LocalBinder : Binder(), com.danizek.dp.IBinder {
-        override fun getService(): IVpn {
-            return this@RemoteVpnService
-        }
+        override fun getService(): IVpn = this@RemoteVpnService
     }
 
     companion object {
         const val START_VPN = "NetguardVpnServiceStart"
         const val STOP_VPN = "NetguardVpnServiceStop"
         const val TAG = "NetguardVpnService"
+
+        /** Maximum size of a single IP packet we relay. */
+        private const val MAX_PACKET_SIZE = 65535
+
+        /** Bytes peeked to determine the IP version and total packet length. */
+        private const val IP_HEADER_PEEK = 20
+        private const val IPV6_HEADER_SIZE = 40
+
+        private const val CONNECT_TIMEOUT_MS = 2000
+        private const val JOIN_TIMEOUT_MS = 3000L
+
+        private val EMPTY_PASSWORD = CharArray(0)
     }
 
     private val binder = LocalBinder()
+
+    /** Guards against concurrent start/stop; also acts as the "is running" flag. */
+    private val running = AtomicBoolean(false)
+
+    /** Signals the threads to stop. */
+    private val stopFlag = AtomicBoolean(false)
+
     private var vpnDescriptor: ParcelFileDescriptor? = null
     private var streamFromDevice: FileInputStream? = null
     private var streamToDevice: FileOutputStream? = null
-    private var appInputStream: InputStream? = null
-    private var appOutputStream: OutputStream? = null
-    private val stopFlag = AtomicBoolean(false)
+    private var appSocket: SSLSocket? = null
+
     private var relayThread: Thread? = null
     private var remoteReaderThread: Thread? = null
+
+    @Volatile
+    private var status: VpnActiveStatus = VpnActiveStatus.INACTIVE
+
+    // connection parameters, populated from the start intent
     private var remoteHost: String = ""
     private var remotePort: Int = 0
-    private var allowedApps: ArrayList<String> = ArrayList()
-    private var appSocket: SSLSocket? = null
-    private val buffer = ByteArray(65535)
-    private val inputBuffer = ByteArray(65535)
-    private var status: VpnActiveStatus = VpnActiveStatus.INACTIVE
-    private val pendingRemotePackets: Queue<ByteArray> = LinkedList()
+    private var allowedApps: List<String> = emptyList()
     private var caCertPath = "ca.cer"
     private var clientCertPath = "clientCert.cer"
     private var clientKeyFile = "key.key"
 
-    override fun getBinder(): com.danizek.dp.IBinder {
-        return binder
-    }
+    override fun getBinder(): com.danizek.dp.IBinder = binder
 
-    override fun startVpn() {
-        if (vpnDescriptor != null) {
-            return
-        }
-
-        val builder = Builder()
-        builder.addAddress("192.168.255.2", 32)
-        builder.addAddress("fd00::2", 32)
-        builder.addRoute("0.0.0.0", 0)
-        builder.addRoute("::", 0)
-        builder.addDnsServer("1.1.1.1")
-        builder.addDnsServer("2606:4700:4700::1111")
-        if (allowedApps.isNotEmpty()) {
-            for (app in allowedApps) {
-                builder.addAllowedApplication(app)
-            }
-        }
-        builder.allowFamily(OsConstants.AF_INET)
-        builder.allowFamily(OsConstants.AF_INET6)
-        builder.setBlocking(true)
-
-        Log.v(TAG, "caCertPath: $caCertPath")
-        Log.v(TAG, "clientCertPath: $clientCertPath")
-        Log.v(TAG, "clientKeyFile: $clientKeyFile")
-
-        vpnDescriptor = builder.establish()
-        Log.v(TAG, vpnDescriptor.toString())
-        streamFromDevice = FileInputStream(vpnDescriptor?.fileDescriptor)
-        streamToDevice = FileOutputStream(vpnDescriptor?.fileDescriptor)
-        stopFlag.set(false)
-
-        Security.addProvider(BouncyCastleProvider())
-        // Load CA cert
-        var reader = PEMParser(FileReader(caCertPath))
-        val caCertHolder = reader.readObject() as X509CertificateHolder
-        val certificateConverter = JcaX509CertificateConverter()
-        val caCert: X509Certificate = certificateConverter.getCertificate(caCertHolder)
-        reader.close()
-        val caKeyStore = KeyStore.getInstance(KeyStore.getDefaultType())
-        caKeyStore.load(null, null)
-        caKeyStore.setCertificateEntry("ca-certificate", caCert)
-        val trustManagerFactory =
-            TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm())
-        trustManagerFactory.init(caKeyStore)
-
-        // Load client cert
-        reader = PEMParser(FileReader(clientCertPath))
-        val certHolder = reader.readObject() as X509CertificateHolder
-        reader.close()
-
-        val cert = certificateConverter.getCertificate(certHolder)
-
-        reader = PEMParser(FileReader(clientKeyFile))
-        val keyObject = reader.readObject()
-        reader.close()
-
-        val keyConverter = JcaPEMKeyConverter()
-
-        var privateKey: PrivateKey? = null
-
-        if (keyObject is PEMEncryptedKeyPair) {
-            val provider = JcePEMDecryptorProviderBuilder().build("".toCharArray())
-            val keyPair: KeyPair = keyConverter.getKeyPair(keyObject.decryptKeyPair(provider))
-            privateKey = keyPair.getPrivate()
-        } else if (keyObject is PEMKeyPair) {
-            val keyPair: KeyPair = keyConverter.getKeyPair(keyObject as PEMKeyPair)
-            privateKey = keyPair.getPrivate()
-        } else if (keyObject is PrivateKey) {
-            privateKey = keyObject as PrivateKey
-        } else if (keyObject is PrivateKeyInfo) {
-            val info = PrivateKeyInfo.getInstance(keyObject)
-            privateKey = keyConverter.getPrivateKey(info)
-        } else {
-            throw java.lang.Exception(
-                java.lang.String.format(
-                    "Unsported type of keyFile %s",
-                    clientKeyFile
-                )
-            )
-        }
-
-        val clientKeyStore = KeyStore.getInstance(KeyStore.getDefaultType())
-        clientKeyStore.load(null, null)
-        clientKeyStore.setCertificateEntry("certificate", cert)
-        clientKeyStore.setKeyEntry(
-            "private-key",
-            privateKey,
-            "".toCharArray(),
-            arrayOf<Certificate>(cert)
-        )
-
-        val keyManagerFactory = KeyManagerFactory
-            .getInstance(KeyManagerFactory.getDefaultAlgorithm())
-        keyManagerFactory.init(clientKeyStore, "".toCharArray())
-
-        relayThread = Thread {
-            Log.v(TAG, "Relay thread start")
-            val tcpSocket = Socket()
-            tcpSocket.bind(InetSocketAddress(0))
-            protect(tcpSocket)
-            status = VpnActiveStatus.CONNECTING
-            try {
-                tcpSocket!!.connect(InetSocketAddress(remoteHost, remotePort), 2000)
-            } catch (e: Exception) {
-                Log.v(TAG, "Failed to connect to remote host")
-                tcpSocket!!.close()
-                status = VpnActiveStatus.ERROR
-                return@Thread
-            }
-            val context = SSLContext.getInstance("TLS");
-            context.init(keyManagerFactory.keyManagers, trustManagerFactory.trustManagers, null)
-            appSocket =
-                context.socketFactory.createSocket(
-                    tcpSocket,
-                    remoteHost,
-                    remotePort,
-                    true
-                ) as SSLSocket
-
-            try {
-                appSocket!!.startHandshake()
-            } catch (e: Exception) {
-                Log.v(TAG, "Failed during SSL handshake: $e")
-                appSocket!!.close()
-                status = VpnActiveStatus.ERROR
-                return@Thread
-            }
-
-            status = VpnActiveStatus.ACTIVE
-            appInputStream = appSocket!!.inputStream
-            appOutputStream = appSocket!!.outputStream
-            remoteReaderThread = Thread {
-                try {
-                    while (!stopFlag.get()) {
-                        readExactly(appInputStream!!, inputBuffer, 0, 20)
-                        var totalLength = 0
-                        totalLength = if (((inputBuffer[0].toInt() shr 4) and 0xFF) == 4) {
-                            ((inputBuffer[2].toInt() and 0xFF) shl 8) or (inputBuffer[3].toInt() and 0xFF)
-                        } else {
-                            (((inputBuffer[4].toInt() and 0xFF) shl 8) or (inputBuffer[5].toInt() and 0xFF)) + 40
-                        }
-                        readExactly(appInputStream!!, inputBuffer, 20, totalLength - 20)
-                        //                        Log.v(TAG, "Received from remote")
-                        streamToDevice!!.write(inputBuffer, 0, totalLength)
-                        streamToDevice!!.flush()
-                    }
-                } catch (e: InterruptedException) {
-                    Log.v(TAG, "Relay thread interrupted")
-                } catch (e: EOFException) {
-                    Log.v(TAG, "EOF")
-                } catch (e: Exception) {
-                    Log.v(TAG, "Exception: $e")
-                }
-            }
-            remoteReaderThread!!.start()
-
-            while (!stopFlag.get()) {
-                try {
-                    val readBytes = streamFromDevice!!.read(buffer)
-                    if (readBytes == -1) {
-                        throw EOFException("EOF")
-                    }
-//                    Log.v(TAG, "Read $readBytes bytes from device")
-                    appOutputStream!!.write(buffer, 0, readBytes)
-                    appOutputStream!!.flush()
-//                    Log.v(TAG, "Sent to remote")
-                } catch (e: InterruptedException) {
-                    Log.v(TAG, "Relay thread interrupted")
-                    break
-                } catch (e: EOFException) {
-                    Log.v(TAG, "EOF")
-                    break
-                } catch (e: Exception) {
-                    Log.v(TAG, "Exception: $e")
-                    status = VpnActiveStatus.ERROR
-                    break
-                }
-            }
-            try {
-                appInputStream?.close()
-                appOutputStream?.close()
-                appSocket?.close()
-                remoteReaderThread!!.interrupt()
-                remoteReaderThread!!.join()
-            } catch (_: InterruptedException) {}
-            catch (_: Exception) {}
-        }
-        relayThread!!.start()
-    }
+    override fun onBind(intent: Intent?): IBinder = binder
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         super.onStartCommand(intent, flags, startId)
         when (intent?.action) {
             START_VPN -> {
-                remoteHost = intent.getStringExtra("remoteHost")!!
+                remoteHost = intent.getStringExtra("remoteHost").orEmpty()
                 remotePort = intent.getLongExtra("remotePort", 0).toInt()
-                allowedApps = intent.getStringArrayListExtra("allowedApps")!!
-                caCertPath = intent.getStringExtra("caCertPath")!!
-                clientCertPath = intent.getStringExtra("clientCertPath")!!
-                clientKeyFile = intent.getStringExtra("clientKeyPath")!!
+                allowedApps = intent.getStringArrayListExtra("allowedApps") ?: emptyList()
+                caCertPath = intent.getStringExtra("caCertPath").orEmpty()
+                clientCertPath = intent.getStringExtra("clientCertPath").orEmpty()
+                clientKeyFile = intent.getStringExtra("clientKeyPath").orEmpty()
 
-                Log.v(TAG, "Remote host: $remoteHost")
-                Log.v(TAG, "Remote port: $remotePort")
+                Log.v(TAG, "Starting VPN to $remoteHost:$remotePort")
                 startVpn()
             }
 
-            STOP_VPN -> {
-                stopVpn()
-            }
+            STOP_VPN -> stopVpn()
         }
         return START_STICKY
-    }
-
-    override fun onBind(intent: Intent?): IBinder {
-        return binder
     }
 
     override fun onRevoke() {
@@ -299,36 +127,276 @@ class RemoteVpnService : VpnService(), IVpn {
         super.onRevoke()
     }
 
+    override fun getVpnStatus(): VpnStatus = VpnStatus(status)
+
+    fun getStatus(): VpnActiveStatus = status
+
+    override fun startVpn() {
+        if (!running.compareAndSet(false, true)) {
+            Log.v(TAG, "startVpn ignored, already running")
+            return
+        }
+
+        try {
+            stopFlag.set(false)
+
+            val descriptor = establishInterface()
+            vpnDescriptor = descriptor
+            streamFromDevice = FileInputStream(descriptor.fileDescriptor)
+            streamToDevice = FileOutputStream(descriptor.fileDescriptor)
+
+            val sslContext = buildSslContext()
+
+            relayThread = Thread({ runTunnel(sslContext) }, "vpn-relay").also { it.start() }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to start VPN", e)
+            status = VpnActiveStatus.ERROR
+            teardown()
+            running.set(false)
+        }
+    }
+
     override fun stopVpn() {
-        streamFromDevice?.close();
-        relayThread?.interrupt()
-        relayThread?.join()
-        stopFlag.set(true)
-        streamFromDevice?.close()
-        streamToDevice?.close()
-        vpnDescriptor?.close()
-        vpnDescriptor = null
-        pendingRemotePackets.clear()
+        if (!running.compareAndSet(true, false)) {
+            return
+        }
+        teardown()
         status = VpnActiveStatus.INACTIVE
         stopSelf()
     }
 
-    override fun getVpnStatus(): VpnStatus {
-        return VpnStatus(getStatus())
+    /**
+     * Signals the threads to stop, unblocks any threads parked in a blocking read by closing their
+     * streams and socket, then joins them and releases the TUN interface.
+     */
+    private fun teardown() {
+        stopFlag.set(true)
+
+        closeQuietly(streamFromDevice)
+        closeQuietly(streamToDevice)
+        closeQuietly(appSocket)
+
+        // The relay thread joins its own remote-reader thread in its finally block, so joining the
+        // relay thread here transitively waits for both threads to finish.
+        joinQuietly(relayThread)
+        closeQuietly(vpnDescriptor)
+
+        relayThread = null
+        remoteReaderThread = null
+        appSocket = null
+        streamFromDevice = null
+        streamToDevice = null
+        vpnDescriptor = null
     }
 
-    private fun readExactly(stream: InputStream, buffer: ByteArray, offset: Int, length: Int) {
-        var curOffset = offset
-        while (curOffset < offset + length) {
-            val read = stream.read(buffer, curOffset, offset + length - curOffset)
-            if (read == -1) {
-                throw EOFException("EOF")
+    private fun establishInterface(): ParcelFileDescriptor {
+        val builder = Builder().apply {
+            addAddress("192.168.255.2", 32)
+            addAddress("fd00::2", 32)
+            addRoute("0.0.0.0", 0)
+            addRoute("::", 0)
+            addDnsServer("1.1.1.1")
+            addDnsServer("2606:4700:4700::1111")
+            allowFamily(OsConstants.AF_INET)
+            allowFamily(OsConstants.AF_INET6)
+            setBlocking(true)
+        }
+        for (app in allowedApps) {
+            try {
+                builder.addAllowedApplication(app)
+            } catch (e: Exception) {
+                Log.w(TAG, "Skipping unknown allowed application: $app", e)
             }
-            curOffset += read
+        }
+        return builder.establish() ?: throw IOException("VpnService.Builder.establish() returned null")
+    }
+
+    /**
+     * Connects to the remote endpoint and runs the two packet threads until stopped or an error
+     * occurs. Runs on the relay thread and owns the lifecycle of its remote-reader thread.
+     */
+    private fun runTunnel(sslContext: SSLContext) {
+        status = VpnActiveStatus.CONNECTING
+
+        val socket = try {
+            connectRemote(sslContext)
+        } catch (e: Exception) {
+            if (!stopFlag.get()) {
+                Log.w(TAG, "Failed to establish tunnel", e)
+                status = VpnActiveStatus.ERROR
+            }
+            return
+        }
+        appSocket = socket
+        status = VpnActiveStatus.ACTIVE
+
+        val tunInput = streamFromDevice ?: return
+        val tunOutput = streamToDevice ?: return
+
+        val reader = Thread({
+            try {
+                forwardRemoteToDevice(socket.inputStream, tunOutput)
+            } catch (e: Exception) {
+                if (!stopFlag.get()) Log.w(TAG, "Remote reader stopped", e)
+            }
+        }, "vpn-remote-reader")
+        remoteReaderThread = reader
+        reader.start()
+
+        try {
+            forwardDeviceToRemote(tunInput, socket.outputStream)
+        } catch (e: Exception) {
+            if (!stopFlag.get()) {
+                Log.w(TAG, "Device reader stopped", e)
+                status = VpnActiveStatus.ERROR
+            }
+        } finally {
+            // Unblock and join the remote reader before this thread exits
+            closeQuietly(socket)
+            joinQuietly(reader)
         }
     }
 
-    fun getStatus(): VpnActiveStatus {
-        return status
+    private fun connectRemote(sslContext: SSLContext): SSLSocket {
+        val tcpSocket = Socket()
+        try {
+            tcpSocket.bind(InetSocketAddress(0))
+            if (!protect(tcpSocket)) {
+                throw IOException("Failed to protect socket from VPN routing")
+            }
+            tcpSocket.connect(InetSocketAddress(remoteHost, remotePort), CONNECT_TIMEOUT_MS)
+
+            val sslSocket = sslContext.socketFactory
+                .createSocket(tcpSocket, remoteHost, remotePort, true) as SSLSocket
+            sslSocket.startHandshake()
+            return sslSocket
+        } catch (e: Exception) {
+            closeQuietly(tcpSocket)
+            throw e
+        }
+    }
+
+    /** Reads packets from the TUN interface and forwards them to the remote socket. */
+    private fun forwardDeviceToRemote(from: FileInputStream, to: OutputStream) {
+        val buffer = ByteArray(MAX_PACKET_SIZE)
+        while (!stopFlag.get()) {
+            val read = from.read(buffer)
+            if (read == -1) throw EOFException("TUN interface closed")
+            to.write(buffer, 0, read)
+            to.flush()
+        }
+    }
+
+    /** Reads length-framed IP packets from the remote socket and writes them to the TUN interface. */
+    private fun forwardRemoteToDevice(from: InputStream, to: FileOutputStream) {
+        val buffer = ByteArray(MAX_PACKET_SIZE)
+        while (!stopFlag.get()) {
+            readExactly(from, buffer, 0, IP_HEADER_PEEK)
+            val totalLength = packetLength(buffer)
+            readExactly(from, buffer, IP_HEADER_PEEK, totalLength - IP_HEADER_PEEK)
+            to.write(buffer, 0, totalLength)
+            to.flush()
+        }
+    }
+
+    /** Derives the total packet length from a peeked IP header. */
+    private fun packetLength(header: ByteArray): Int {
+        val version = (header[0].toInt() shr 4) and 0x0F
+        return if (version == 4) {
+            ((header[2].toInt() and 0xFF) shl 8) or (header[3].toInt() and 0xFF)
+        } else {
+            val payloadLength = ((header[4].toInt() and 0xFF) shl 8) or (header[5].toInt() and 0xFF)
+            payloadLength + IPV6_HEADER_SIZE
+        }
+    }
+
+    private fun readExactly(stream: InputStream, buffer: ByteArray, offset: Int, length: Int) {
+        var read = 0
+        while (read < length) {
+            val count = stream.read(buffer, offset + read, length - read)
+            if (count == -1) throw EOFException("Remote stream closed")
+            read += count
+        }
+    }
+
+    private fun buildSslContext(): SSLContext {
+        Security.addProvider(BouncyCastleProvider())
+        val keyManagers = buildKeyManagers(clientCertPath, clientKeyFile)
+        val trustManagers = buildTrustManagers(caCertPath)
+        return SSLContext.getInstance("TLS").apply {
+            init(keyManagers, trustManagers, null)
+        }
+    }
+
+    private fun buildTrustManagers(caCertPath: String): Array<TrustManager> {
+        val caCert = readCertificate(caCertPath)
+        val keyStore = KeyStore.getInstance(KeyStore.getDefaultType()).apply {
+            load(null, null)
+            setCertificateEntry("ca-certificate", caCert)
+        }
+        return TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm()).run {
+            init(keyStore)
+            trustManagers
+        }
+    }
+
+    private fun buildKeyManagers(certPath: String, keyPath: String): Array<KeyManager> {
+        val cert = readCertificate(certPath)
+        val privateKey = readPrivateKey(keyPath)
+        val keyStore = KeyStore.getInstance(KeyStore.getDefaultType()).apply {
+            load(null, null)
+            setCertificateEntry("certificate", cert)
+            setKeyEntry("private-key", privateKey, EMPTY_PASSWORD, arrayOf<Certificate>(cert))
+        }
+        return KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm()).run {
+            init(keyStore, EMPTY_PASSWORD)
+            keyManagers
+        }
+    }
+
+    private fun readCertificate(path: String): X509Certificate {
+        PEMParser(FileReader(path)).use { parser ->
+            val holder = parser.readObject() as? X509CertificateHolder
+                ?: throw IOException("No X.509 certificate found in $path")
+            return JcaX509CertificateConverter().getCertificate(holder)
+        }
+    }
+
+    private fun readPrivateKey(path: String): PrivateKey {
+        PEMParser(FileReader(path)).use { parser ->
+            val keyObject = parser.readObject()
+            val converter = JcaPEMKeyConverter()
+            return when (keyObject) {
+                is PEMEncryptedKeyPair -> {
+                    val decryptor = JcePEMDecryptorProviderBuilder().build(EMPTY_PASSWORD)
+                    converter.getKeyPair(keyObject.decryptKeyPair(decryptor)).private
+                }
+                is PEMKeyPair -> converter.getKeyPair(keyObject).private
+                is PrivateKey -> keyObject
+                is PrivateKeyInfo -> converter.getPrivateKey(keyObject)
+                else -> throw IOException("Unsupported key file format: $path")
+            }
+        }
+    }
+
+    private fun closeQuietly(closeable: Closeable?) {
+        try {
+            closeable?.close()
+        } catch (e: Exception) {
+            Log.v(TAG, "Ignoring error while closing resource", e)
+        }
+    }
+
+    private fun joinQuietly(thread: Thread?, timeoutMs: Long = JOIN_TIMEOUT_MS) {
+        if (thread == null || thread === Thread.currentThread()) return
+        try {
+            thread.join(timeoutMs)
+            if (thread.isAlive) {
+                Log.w(TAG, "Thread '${thread.name}' did not terminate within ${timeoutMs}ms")
+                thread.interrupt()
+            }
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
     }
 }
